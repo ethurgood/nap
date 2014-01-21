@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     'valid_get_status': (200,),
     'valid_update_status': (204,),
     'valid_create_status': (201,),
+    'valid_delete_status': (200, 202, 204),
     'log_level': 'CRITICAL',
     'cache_backend': BaseCacheBackend(),
     'cached_methods': ('GET', ),
@@ -38,7 +39,7 @@ class NapConfig(dict):
 
         config.update(conf)
         config.update(kwargs)
-        logger = logging.getLogger()
+        logger = logging.getLogger('nap:%s' % config['resource_name'])
         log_level = getattr(logging, config['log_level'])
         logger.setLevel(log_level)
 

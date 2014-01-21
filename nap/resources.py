@@ -1,10 +1,15 @@
 from .conf import NapConfig
 from .fields import Field
-from .http import NapRequest
+from .http import NapRequest, NapResponse
 from .lookup import default_lookup_urls
 from .serializers import JSONSerializer
 from .utils import make_url, handle_slash
-from .cache.base import CacheRequestsResponse
+
+class ListWithAttributes(list):
+    def __init__(self, list_vals, extra_data):
+        super(ListWithAttributes, self).__init__()
+        self.extend(list_vals)
+        self.extra_data = extra_data
 
 
 class DataModelMetaClass(type):
@@ -68,7 +73,7 @@ class ResourceModel(object):
 
         self._raw_field_data = field_data
         if not hasattr(field_data, 'keys'):
-            # field_Data is not a map-like object, so let's try coercing it
+            # field_data is not a map-like object, so let's try coercing it
             # from a string
             serializer = self.get_serializer()
             field_data = serializer.deserialize(field_data)
@@ -172,18 +177,16 @@ class ResourceModel(object):
                 return cached_response
 
         resource_response = request.send()
+        response = NapResponse(
+            url=request.url,
+            status_code=resource_response.status_code,
+            headers=resource_response.headers,
+            content=resource_response.content,
+            use_cache=use_cache,
 
-        if use_cache:
-            self.logger.debug("Setting response into cache for %s" % url)
-            # requests.Response is not easily cached, and contains things we
-            # don't need to remember. So let's cache a thin wrapper around
-            # its content
-            cached_response = CacheRequestsResponse(
-                content=resource_response.content,
-                status_code=resource_response.status_code)
-            self.cache.set(request, cached_response)
-
-        return resource_response
+        )
+        # return resource_response
+        return response
 
     # url methods
     @classmethod
@@ -219,6 +222,15 @@ class ResourceModel(object):
         """
         return self._generate_url(url_type='create', **kwargs)
 
+    def get_delete_url(self, **kwargs):
+        """Generate a URL suitable for delete requests based on ``kwargs``
+
+        By default, this is the first valid update URL.
+
+        :param kwargs: URL lookup variables
+        """
+        return self._generate_url(url_type='update', **kwargs)
+
     # access methods
     @classmethod
     def get_from_uri(cls, url, *args, **kwargs):
@@ -236,7 +248,7 @@ class ResourceModel(object):
         request directly to that URL. otherwise, attempt a lookup request.
 
         :param uri: a string representing an API uri
-        :param kwargs: optional variables to send to \
+        :param kwargs: optional variables to send to
             :meth:`~nap.resources.ResourceClass.lookup`
         """
 
@@ -272,8 +284,10 @@ class ResourceModel(object):
     def validate_get_response(self, response):
         """Validate get response is valid to use for updating our object
         """
+
+        self.validate_response(response)
         if response.status_code not in self._meta['valid_get_status']:
-            raise ValueError("Expected status code in %s, got %s" %\
+            raise ValueError("Expected status code in %s, got %s" %
                 (self._meta['valid_get_status'], response.status_code))
 
     def handle_get_response(self, response):
@@ -284,6 +298,7 @@ class ResourceModel(object):
 
         self._raw_response_content = resource_data
         self.update_fields(resource_data)
+        self.handle_response(response)
 
     # collection access methods
     @classmethod
@@ -303,31 +318,36 @@ class ResourceModel(object):
         """
         tmp_obj = cls()
         url = tmp_obj._generate_url(url_type='collection', **lookup_vars)
-        r = tmp_obj._request('GET', url)
+        response = tmp_obj._request('GET', url)
 
-        if r.status_code not in (200,):
-            raise ValueError('http error')
+        tmp_obj.validate_collection_response(response)
 
         serializer = tmp_obj.get_serializer()
-        r_data = serializer.deserialize(r.content)
+        r_data = serializer.deserialize(response.content)
         collection_field = cls._meta.get('collection_field')
         if collection_field:
             obj_list = r_data[collection_field]
+
+            extra_data = r_data.copy()
+            del(extra_data[collection_field])
+
         else:
             obj_list = r_data
+            extra_data = {}
 
         if not hasattr(obj_list, '__iter__'):
             raise ValueError('excpeted array-type response')
 
         resource_list = [cls(**obj_dict) for obj_dict in obj_list]
-
-        return resource_list
+        return ListWithAttributes(resource_list, extra_data)
 
     def validate_collection_response(self, response):
         """Validate get response is valid to use for updating our object
         """
+
+        self.validate_response(response)
         if response.status_code not in self._meta['valid_get_status']:
-            raise ValueError("Expected status code in %s, got %s" %\
+            raise ValueError("Expected status code in %s, got %s" %
                 (self._meta['valid_get_status'], response.status_code))
 
     # write methods
@@ -352,12 +372,14 @@ class ResourceModel(object):
         self.handle_update_response(response)
 
     def validate_update_response(self, response):
+
+        self.validate_response(response)
         if response.status_code not in self._meta['valid_update_status']:
-            raise ValueError("Invalid Update Response: expected stauts_code"
-                        " in %s, got %s" % \
+            raise ValueError("Invalid Update Response: expected status_code"
+                        " in %s, got %s" %
                         (self._meta['valid_update_status'], response.status_code))
 
-    def handle_update_response(self, r):
+    def handle_update_response(self, response):
         """Handle any actions needed after a HTTP response has been validated
         for an update action
 
@@ -366,13 +388,15 @@ class ResourceModel(object):
 
         :param response: a requests.Response object
         """
-        if not self._meta['update_from_write'] or not r.content:
+        if not self._meta['update_from_write'] or not response.content:
             return
 
         try:
-            self.update_fields(r.content)
+            self.update_fields(response.content)
         except ValueError:
             return
+
+        self.handle_response(response)
 
     def create(self, **kwargs):
         """Sends a create request to the API, validating and handling any
@@ -389,7 +413,23 @@ class ResourceModel(object):
         self.validate_create_response(response)
         self.handle_create_response(response)
 
+    def delete(self, **kwargs):
+        """Sends a delete request to the API, validating and handling any
+        response received.
+
+        :param kwargs: keyword arguments passed to get_delete_url
+        """
+        headers = {'content-type': 'application/json'}
+
+        response = self._request('DELETE', self.get_delete_url(**kwargs),
+            headers=headers)
+
+        self.validate_delete_response(response)
+        self.handle_delete_response(response)
+
     def validate_create_response(self, response):
+
+        self.validate_response(response)
         if response.status_code not in self._meta['valid_create_status']:
             raise ValueError
 
@@ -412,6 +452,27 @@ class ResourceModel(object):
             self.update_fields(response.content)
         except ValueError:
             return
+
+        self.handle_response(response)
+
+    def validate_delete_response(self, response):
+
+        self.validate_response(response)
+        if response.status_code not in self._meta['valid_delete_status']:
+            raise ValueError
+
+    def handle_delete_response(self, response):
+        """Handle any actions needed after a HTTP response has been validated
+        for a delete action
+
+        Intended for easy subclassing. By default, attempt to update the
+        current object from the response's content
+
+        :param response: a requests.Response object
+        """
+
+        self.resource_id = None
+        self.handle_response(response)
 
     def save(self, **kwargs):
         """Contextually save current object. If an object can generate an
@@ -461,6 +522,27 @@ class ResourceModel(object):
     def get_serializer(self):
         return JSONSerializer()
 
+    def validate_response(self, response):
+        """
+        Default validator for all response types.
+
+        By default does nothing, but gives a all-around hook for subclasses
+        to use
+        """
+        pass
+
+    def handle_response(self, response):
+        """
+        Default handler for all response types. Ran as the last step in a
+        request/response cycle
+        """
+        if response.use_cache:
+            self.logger.debug("Setting response into cache for %s" % response.url)
+            # requests.Response is not easily cached, and contains things we
+            # don't need to remember. So let's cache a thin wrapper around
+            # its content
+            self.cache.set(response)
+
     # properties
     @property
     def full_url(self):
@@ -495,7 +577,7 @@ class ResourceModel(object):
 
     # etc
     def __unicode__(self):
-        return "<%s: %s>" % (self.__class__.__name__, self.resource_id)
+        return unicode(self.resource_id)
 
     def __repr__(self):
-        return unicode(self)
+        return "<%s: %s>" % (self.__class__.__name__, self.__unicode__())
